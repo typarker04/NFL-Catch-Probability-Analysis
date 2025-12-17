@@ -1,0 +1,854 @@
+---
+title: "NFL Catch Probability Analysis"
+author: "Tyler Parker & Colby Beliveau"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    code_folding: hide
+    theme: simplex
+    highlight: tango
+  
+
+---
+
+
+
+# Introduction
+
+This report describes the development of a catch probability model for National Football League (NFL) passing plays using player tracking data. The main objective is to quantify how likely a pass is to be completed as a function of the spatial relationship between the targeted receiver and nearby defenders, along with contextual information such as player speed and physical attributes.
+
+We begin by loading and filtering the raw tracking and play-by-play data to focus on deep passing plays that travel at least 20 yards downfield and are not nullified by penalties. We then engineer a set of football-specific features that summarize separation at the moment of the throw and at the catch point, the number of defenders in close proximity, receiver speed, height differences between receivers and defenders, and positional advantages at the time of the throw.
+
+Using these engineered features, we fit a random forest classification model to predict whether a pass is caught or not. Finally, we apply the model at the frame level for individual plays to visualize how catch probability evolves over the course of a route and how key moments in the play change the likelihood of a completion.
+
+# Methods
+
+### Data loading and initial filtering
+We decided to fit our model based on throws greater than or equal to 20 air yards, and those that had not been nullified by a penalty. This way, we would be able to make better generalizations because the ball is in the air for a longer time. 
+
+```{r, message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(knitr)
+```
+
+
+```{r load-and-filter-data, message=FALSE}
+raw_w1_input <- readr::read_csv("114239_nfl_competition_files_published_analytics_final/train/input/input_2023_w01.csv")
+raw_w1_output <- readr::read_csv("114239_nfl_competition_files_published_analytics_final/train/output/output_2023_w01.csv")
+data = read.csv("114239_nfl_competition_files_published_analytics_final/supplementary_data.csv")
+data = data %>% #arrange plays by chronologically by game for efficient querying later.
+  filter(play_nullified_by_penalty == "N", pass_length>=20) %>% 
+  separate(game_clock, into = c("min", "sec"), sep = ":", convert = TRUE) %>%
+  mutate(game_clock_seconds = min * 60 + sec) %>% 
+  arrange(week, game_id, quarter, desc(game_clock_seconds))
+data$game_play = paste0(data$game_id, "_", data$play_id) #create a unique play id combining play and game id. Helpful for indexing single plays in this dataset.
+set.seed(479)
+```
+
+```{r setup, include=FALSE}
+data_filtered_completions = data %>% #These next few chunks are mainly for data preprocessing and me figuring out what is what
+  filter(pass_length >= 20,
+         pass_result == "C",
+         week == 1)
+data_filtered_non_complete = data %>%
+  filter(pass_length >= 20,
+         pass_result != "C",
+         week == 1)
+
+full_plays = rbind(data_filtered_completions, data_filtered_non_complete)
+```
+
+```{r include=FALSE}
+joined_completions = data_filtered_completions %>% 
+  inner_join(raw_w1_input, by = c("game_id", "play_id"))
+
+joined_non_completions = data_filtered_non_complete %>% 
+  inner_join(raw_w1_input, by = c("game_id", "play_id"))
+
+play_idx_completions = unique(joined_completions$play_id)
+
+play_idx_non_completions = unique(joined_non_completions$play_id)
+
+first_play <- joined_completions %>% filter(play_id %in% play_idx_completions[20])
+first_play_idx = first_play$play_id
+
+one_play <- raw_w1_input %>%
+  filter(play_id %in% first_play_idx, 
+         player_role %in% c("Passer", "Targeted Receiver", "Defensive Coverage")
+         )
+```
+
+```{r include=FALSE}
+gid <- one_play$game_id[1]
+pid <- one_play$play_id[1]
+
+tmp_in <-
+  raw_w1_input |>
+  dplyr::filter(game_id == gid & play_id == pid)
+
+tmp_out <-
+  raw_w1_output |>
+  dplyr::filter(game_id == gid & play_id == pid)
+
+ball_land_x <- tmp_in$ball_land_x[1]
+ball_land_y <- tmp_in$ball_land_y[1]
+all_players <- unique(c(tmp_in$nfl_id, tmp_out$nfl_id))
+
+oi_colors <- palette.colors(palette = "Okabe-Ito")
+
+par(mar = c(1,1,1,1), mgp = c(1.8, 0.5, 0))
+plot(1, type = "n", xlim = c(0,120), ylim = c(0, 54),
+     xaxt = "n", yaxt = "n", xlab = "", ylab = "")
+
+points(ball_land_x, ball_land_y, pch = 4, cex = 2, col = oi_colors[8])
+lines(x = c(tmp_in$absolute_yardline_number[1], tmp_in$absolute_yardline_number[1]),
+      y = c(par("usr")[3], par("usr")[4]))
+for(player in all_players){
+  player_in <-
+    tmp_in |>
+    dplyr::filter(nfl_id == player)
+  role <- player_in$player_role[1]
+
+  if(role %in% c("Passer", "Targeted Receiver", "Other Route Runner")){
+    points(player_in$x, player_in$y, pch = 16, cex = 0.5,
+           col = adjustcolor(oi_colors[9], alpha.f = 0.5))
+  } else{
+    points(player_in$x, player_in$y, pch = 15, cex = 0.5,
+           col = adjustcolor(oi_colors[9], alpha.f = 0.5))
+  }
+
+  if(player_in$player_to_predict[1]){
+    player_out <-
+      tmp_out |>
+      dplyr::filter(nfl_id == player)
+    if(role %in% c("Passer", "Targeted Receiver", "Other Route Runner")){
+      points(player_out$x, player_out$y, pch = 16, cex = 0.5,
+             col = adjustcolor(oi_colors[2], alpha.f = 0.75))
+    } else{
+        points(player_out$x, player_out$y, pch = 15, cex = 0.5,
+               col = adjustcolor(oi_colors[3], alpha.f = 0.75))
+    }
+  }
+}
+
+legend("topleft", legend = c("Offense", "Defense"), pch = c(15, 16), col = oi_colors[c(2,3)], bty = "n")
+legend("bottomright", legend = c("Pre-throw", "Ball in air", "Ball end location"), pch = c(10, 11, 4),
+       col = oi_colors[c(9,9, 8)], bty = "n")
+```
+
+
+
+## Feature engineering
+
+To model catch probability from NFL player-tracking data, we create six football-specific features that summarize receiver separation, defensive pressure, player attributes, and positional leverage during each pass play. These features are derived from both the tracking input data (frame-level player locations) and the tracking output data (ball arrival metadata).
+
+Each feature is described below.
+```{r feature engineering}
+# Helper functions
+get_distance = function(x1, y1, x2, y2) {
+  sqrt((x2-x1)^2 + (y2-y1)^2)
+}
+
+height_conversion = function(height){
+  parts = strsplit(height, "-")[[1]]
+  feet = as.numeric(parts[1])
+  inches = as.numeric(parts[2])
+  
+  total_inches = feet * 12 + inches
+  return(total_inches)
+}
+```
+
+### 1. Separation at Throw
+
+Definition:
+The distance (yards) between the targeted receiver and the nearest coverage defender at the exact frame when the quarterback releases the ball.
+
+How it is computed:
+
+- Look at last frame in the input (pre-throw) dataframe.
+
+- Extract the targeted receiver’s coordinates in that frame.
+
+- Use get_distance function to compute distance to all defenders.
+
+- Take the minimum of these distances.
+
+Purpose:
+Measures how much space the receiver has when the ball is thrown. More separation typically corresponds to higher completion probability.
+```{r feature engineering 1}
+# Separation at throw, separation at arrival
+get_separation_at_throw = function(input_play_df){
+  # Get the last frame (moment ball is thrown)
+  last_frame = max(input_play_df$frame_id, na.rm = TRUE)
+  throw_moment = input_play_df %>% filter(frame_id == last_frame)
+  
+  receiver = throw_moment %>% filter(player_role == "Targeted Receiver")
+  defenders = throw_moment %>% filter(player_role == "Defensive Coverage")
+
+  distances <- sapply(1:nrow(defenders), function(i) {
+    get_distance(receiver$x[1], receiver$y[1], 
+                  defenders$x[i], defenders$y[i])
+  })
+  
+  distances = as.numeric(distances)
+  if(length(distances) == 0 || all(is.na(distances))) return(NA_real_)
+  min(distances, na.rm = TRUE)
+}
+```
+
+### 2. Separation at Arrival
+
+Definition:
+The distance (yards) between the receiver and the nearest defender at the frame when the ball arrives (last frame in output dataframe).
+
+How it is computed:
+
+- Use the tracking output file to identify the ball arrival frame.
+
+- Compute distances between the receiver and all defenders.
+
+- Take the minimum distance.
+
+Purpose:
+Captures how the passing window evolves after the throw. This is often the strongest single predictor of completion likelihood.
+```{r feature engineering 2 }
+get_separation_at_arrival = function(input_play_df, output_play_df){
+  # Get the first frame (moment ball is caught)
+  if (nrow(output_play_df) == 0) return(NA_real_)
+
+  first_frame = min(output_play_df$frame_id, na.rm = TRUE)
+  arrival_moment = output_play_df %>% filter(frame_id == first_frame)
+  
+  receiver_idx = unique(input_play_df %>% filter(player_role == "Targeted Receiver") %>% pull(nfl_id))
+  defenders_idx = unique(input_play_df %>% filter(player_role == "Defensive Coverage") %>% pull(nfl_id))
+  
+  receiver = arrival_moment %>% filter(nfl_id %in% receiver_idx)
+  defenders = arrival_moment %>% filter(nfl_id %in% defenders_idx)
+  if (nrow(receiver) == 0 || nrow(defenders) == 0) return(NA_real_)
+
+  distances <- sapply(1:nrow(defenders), function(i) {
+    get_distance(receiver$x[1], receiver$y[1], 
+                  defenders$x[i], defenders$y[i])
+  })
+  distances = as.numeric(distances)
+  if(length(distances) == 0 || all(is.na(distances))) return(NA_real_)
+  min(distances, na.rm = TRUE)
+}
+```
+
+### 3. Defenders Within Three Yards
+
+Definition:
+The number of defenders positioned within three yards of the targeted receiver at the ball arrival frame.
+
+How it is computed:
+
+- At the arrival frame, compute distances between the receiver and each defender.
+
+- Count how many defenders satisfy distance ≤ 3 yards.
+
+Purpose:
+Quantifies defensive contesting at the catch point. A more crowded environment dramatically decreases the chance of a catch.
+```{r feature engineering 3}
+get_defenders_within_3yds = function(input_play_df, output_play_df){
+  last_frame = max(output_play_df$frame_id)
+  arrival_moment = output_play_df %>% filter(frame_id == last_frame)
+  
+  receiver_idx = unique(input_play_df %>% filter(player_role == "Targeted Receiver") %>% pull(nfl_id))
+  defenders_idx = unique(input_play_df %>% filter(player_role == "Defensive Coverage") %>% pull(nfl_id))
+  
+  receiver = arrival_moment %>% filter(nfl_id %in% receiver_idx)
+  defenders = arrival_moment %>% filter(nfl_id %in% defenders_idx)
+  
+  distances <- sapply(1:nrow(defenders), function(i) {
+    get_distance(receiver$x[1], receiver$y[1], 
+                  defenders$x[i], defenders$y[i])
+  })
+  
+  sum(distances <= 3) 
+}
+```
+
+### 4. Receiver Maximum Speed
+
+Definition:
+The maximum speed (mph) reached by the targeted receiver during the play prior to ball arrival.
+
+How it is computed:
+
+- Extract the receiver’s speed values across all frames in the play.
+
+- Take the maximum observed value.
+
+Purpose:
+Represents receiver athleticism and route tempo. Faster receivers typically create more separation and run more effective routes.
+```{r feature engineering 4 }
+# Max receiver speed during the route
+get_receiver_speed = function(input_play_df){
+  receiver_idx = unique(input_play_df %>% filter(player_role == "Targeted Receiver") %>% pull(nfl_id))
+  receiver = input_play_df %>% filter(nfl_id %in% receiver_idx)
+  
+  max_mph = max(receiver$s)*2.04545  # Assuming 's' is the speed column
+  max_mph
+}
+```
+
+### 5. Height Difference (Receiver − Nearest Defender)
+
+Definition:
+The difference in height (in inches) between the targeted receiver and the nearest defender.
+
+How it is computed:
+
+- Convert heights from the "Feet-Inches" string format into total inches.
+
+- Identify the defender who is closest to the receiver at the arrival frame.
+
+- Subtract receiver height from defender height.
+
+Purpose:
+Models physical advantage in contested situations. Taller receivers often have an edge in jump-ball or tightly defended scenarios.
+```{r feature engineering 5 }
+# Height difference between receiver and nearest defender
+get_height_difference = function(input_play_df, output_play_df){
+  receiver_idx = unique(input_play_df %>% filter(player_role == "Targeted Receiver") %>% pull(nfl_id))
+  defenders_idx = unique(input_play_df %>% filter(player_role == "Defensive Coverage") %>% pull(nfl_id))
+  
+  receiver = input_play_df %>% filter(nfl_id %in% receiver_idx)
+  defenders = input_play_df %>% filter(nfl_id %in% defenders_idx)
+  
+  distances = sapply(1:nrow(defenders), function(i) {
+    get_distance(receiver$x[1], receiver$y[1], 
+                  defenders$x[i], defenders$y[i])
+  })
+  nearest_defender_id = defenders$nfl_id[which.min(distances)]
+  
+  receiver_height = input_play_df %>% filter(nfl_id %in% receiver_idx) %>% pull(player_height)
+  defender_height = input_play_df %>% filter(nfl_id %in% nearest_defender_id) %>% pull(player_height)
+  
+  height_conversion(receiver_height) - height_conversion(defender_height)  
+}
+```
+
+### 6. Distance Advantage at Throw
+
+Definition:
+The difference in distance to the ball’s eventual landing location between the nearest defender and the receiver at the time of the throw.
+Formally:
+(defender distance to landing) − (receiver distance to landing)
+
+How it is computed:
+
+- Obtain ball landing coordinates from the tracking output.
+
+- At the throw frame, compute:
+
+  - receiver distance to the landing spot
+
+  - nearest defender distance to the landing spot
+
+- Subtract the two distances.
+
+Purpose:
+Measures positional leverage at the moment of release.
+Positive values indicate the receiver is closer to where the ball will arrive (advantageous), while negative values indicate the defender is closer.
+```{r feature engineering 6 }
+get_distance_advantage_throw = function(input_play_df){
+  last_frame = max(input_play_df$frame_id)
+  throw_moment = input_play_df %>% filter(frame_id == last_frame)
+  
+  receiver = throw_moment %>% filter(player_role == "Targeted Receiver")
+  defenders = throw_moment %>% filter(player_role == "Defensive Coverage")
+  
+  landing_x = receiver$ball_land_x[1]
+  landing_y = receiver$ball_land_y[1]
+  
+  receiver_to_defender = sapply(1:nrow(defenders), function(i){
+    get_distance(receiver$x[1], receiver$y[1],
+                 defenders$x[i], defenders$y[i])
+  })
+  nearest_defender_idx = which.min(receiver_to_defender)
+  covering_defender = defenders[nearest_defender_idx, ]
+  
+  receiver_distance = get_distance(receiver$x, receiver$y,
+                                   landing_x, landing_y)
+  
+  defender_distance = get_distance(covering_defender$x[1], covering_defender$y[1],
+                                   landing_x, landing_y)
+    
+  advantage = defender_distance- receiver_distance
+  return(advantage)
+}
+```
+
+### Summary of features
+
+Together, these six engineered features capture key spatial and contextual aspects of receiver–defender interactions.
+These features serve as interpretable, meaningful inputs to the football catch probability model used later in this analysis.
+```{r echo=FALSE}
+# get_distance_advantage_arrival = function(input_play_df, output_play_df){ This function turned out to overfit my model, as it was essentially cheating using the outcome of the play to determine the result.
+#   first_frame = min(output_play_df$frame_id, na.rm = TRUE)
+#   arrival_moment = output_play_df %>% filter(frame_id == first_frame)
+#   
+#   receiver_idx = unique(input_play_df %>% filter(player_role == "Targeted Receiver") %>% pull(nfl_id))
+#   defenders_idx = unique(input_play_df %>% filter(player_role == "Defensive Coverage") %>% pull(nfl_id))
+#   
+#   receiver = arrival_moment %>% filter(nfl_id %in% receiver_idx)
+#   defenders = arrival_moment %>% filter(nfl_id %in% defenders_idx)
+#   
+#   landing_x = input_play_df$ball_land_x[1]
+#   landing_y = input_play_df$ball_land_y[1]
+#   
+#   receiver_distance = get_distance(receiver$x, receiver$y,
+#                                    landing_x, landing_y)
+# 
+#   defender_distances =sapply(1:nrow(defenders), function(i) {
+#     get_distance(defenders$x[i], defenders$y[i], 
+#                   landing_x, landing_y)
+#   })
+#   
+#   defender_distances = as.numeric(defender_distances)
+#   nearest_defender = min(defender_distances, na.rm = TRUE)
+#   advantage = nearest_defender- receiver_distance
+#   return(advantage)
+# }
+
+```
+
+```{r echo=FALSE}
+# More preprocessing. figuring out how i want to structure my week by week dfs.
+week1_features_completions = data.frame(
+  play_id = play_idx_completions,
+  sep_at_throw = NA,
+  sep_at_arrival = NA,
+  defenders_within_3 = NA,
+  max_receiver_speed = NA, 
+  height_diff = NA,
+  result = NA
+)
+```
+
+
+```{r echo=FALSE, eval=FALSE}
+for(i in 1:length(play_idx_completions)) {
+  pid = play_idx_completions[i]
+  
+  # Filter data for this specific play
+  play_input = raw_w1_input %>% filter(play_id == pid)
+  play_output = raw_w1_output %>% filter(play_id == pid)
+  
+  week1_features_completions$sep_at_throw[i] = get_separation_at_throw(play_input)
+  week1_features_completions$sep_at_arrival[i] = get_separation_at_arrival(play_input, play_output)
+  week1_features_completions$defenders_within_3[i] = get_defenders_within_3yds(play_input, play_output)
+  week1_features_completions$max_receiver_speed[i] = get_receiver_speed(play_input)
+  week1_features_completions$height_diff[i] = get_height_difference(play_input, play_output)
+  
+  result_value = joined_completions %>% filter(play_id == pid) %>% pull(pass_result)
+  week1_features_completions$result[i] = ifelse(length(result_value) > 0, result_value[1], NA)
+  
+}
+
+summary(week1_features_completions)
+```
+
+```{r echo=FALSE, eval=FALSE}
+week1_features_non_completions = data.frame(
+  play_id = play_idx_non_completions,
+  sep_at_throw = NA,
+  sep_at_arrival = NA,
+  defenders_within_3 = NA,
+  max_receiver_speed = NA, 
+  height_diff = NA,
+  result = NA
+)
+
+for(i in 1:length(play_idx_non_completions)) {
+  pid = play_idx_non_completions[i]
+  
+  play_input = raw_w1_input %>% filter(play_id == pid)
+  play_output = raw_w1_output %>% filter(play_id == pid)
+  
+  # Calculate all features
+  week1_features_non_completions$sep_at_throw[i] = get_separation_at_throw(play_input)
+  week1_features_non_completions$sep_at_arrival[i] = get_separation_at_arrival(play_input, play_output)
+  week1_features_non_completions$defenders_within_3[i] = get_defenders_within_3yds(play_input, play_output)
+  week1_features_non_completions$max_receiver_speed[i] = get_receiver_speed(play_input)
+  week1_features_non_completions$height_diff[i] = get_height_difference(play_input, play_output)
+  
+  result_value = joined_non_completions %>% filter(play_id == pid) %>% pull(pass_result)
+  week1_features_non_completions$result[i] = ifelse(length(result_value) > 0, result_value[1], NA)
+  
+}
+summary(week1_features_non_completions)
+```
+
+## Loading Data for Model
+
+Compiling all our input and output data into a single file makes it very easy to run it through our model. Below is an example of a single play that has been evaluated using our features we engineered above.
+
+```{r load-all-weks, eval=FALSE}
+process_all_weeks_training = function(input_folder, output_folder, weeks = 1:18) {
+  
+  all_features = data.frame()
+  data = read.csv("114239_nfl_competition_files_published_analytics_final/supplementary_data.csv")
+  data$game_play = paste0(data$game_id, "_", data$play_id)
+
+  for(week in weeks) {
+    cat(paste0("\n========== Processing Week ", week, " ==========\n"))
+    
+    week_str = sprintf("%02d", week)
+    
+    input_file = paste0(input_folder, "/input_2023_w", week_str, ".csv")
+    output_file = paste0(output_folder, "/output_2023_w", week_str, ".csv")
+    
+    week_input = read.csv(input_file)
+    week_output = read.csv(output_file)
+    
+    week_input$game_play  = paste0(week_input$game_id,  "_", week_input$play_id) #Ran into issues due to non-unique play id's. This makes a unique game_id-play_id key for each play.
+    week_output$game_play = paste0(week_output$game_id, "_", week_output$play_id)
+    
+    week_long_plays = data %>% 
+      filter(week == !!week, 
+             pass_length >= 20,
+             play_nullified_by_penalty == "N")
+    play_ids_this_week = intersect(week_long_plays$game_play, unique(week_input$game_play))
+    
+    week_input_filtered = week_input %>% filter(game_play %in% play_ids_this_week)
+    week_output_filtered = week_output %>% filter(game_play %in% play_ids_this_week)
+    
+    play_ids = unique(week_input_filtered$game_play)
+    
+    week_features = data.frame(
+      week = week,
+      game_play = play_ids,
+      sep_at_throw = NA,
+      sep_at_arrival = NA,
+      defenders_within_3 = NA,
+      receiver_speed = NA,
+      height_diff = NA,
+      completion = NA,
+      
+      advantage_at_throw = NA
+    )
+    
+    for(i in 1:length(play_ids)) {
+      gp = play_ids[i]
+      parts = strsplit(gp, "_")[[1]]
+      gid = as.numeric(parts[1])
+      pid = as.numeric(parts[2])
+      
+      play_input = week_input %>% filter(game_id == gid, play_id == pid)
+      play_output = week_output %>% filter(game_id == gid, play_id == pid)
+      
+      week_features$sep_at_throw[i] = get_separation_at_throw(play_input)
+      week_features$sep_at_arrival[i] = get_separation_at_arrival(play_input, play_output)
+      week_features$defenders_within_3[i] = get_defenders_within_3yds(play_input, play_output)
+      week_features$receiver_speed[i] = get_receiver_speed(play_input)
+      week_features$height_diff[i] = get_height_difference(play_input, play_output)
+      
+      week_features$advantage_at_throw[i] = get_distance_advantage_throw(play_input)
+
+      if(i %% 50 == 0) cat("  Processed", i, "of", length(play_ids), "plays\n")
+    }
+    
+    all_features = rbind(all_features, week_features)
+    cat(paste0("Week ", week, " complete: ", nrow(week_features), " plays\n"))
+  }
+  
+  return(all_features)
+}
+train_df = process_all_weeks_training(
+  input_folder = "114239_nfl_competition_files_published_analytics_final/train/input", 
+  output_folder = "114239_nfl_competition_files_published_analytics_final/train/output"
+)
+
+result_lookup = setNames(data$pass_result, data$game_play)
+train_df$pass_result = result_lookup[as.character(train_df$game_play)]
+
+train_df_clean = train_df %>%
+  mutate(catch = ifelse(pass_result == "C", 1, 0)) %>%
+  select(catch, sep_at_throw, sep_at_arrival, defenders_within_3, 
+         receiver_speed, height_diff, advantage_at_throw, game_play) %>%
+  drop_na() %>%
+  filter(
+    !is.infinite(sep_at_throw), !is.infinite(sep_at_arrival),
+    !is.infinite(defenders_within_3), !is.infinite(receiver_speed),
+    !is.infinite(height_diff)
+  ) %>%
+  mutate(catch = as.factor(catch))
+write.csv(train_df_clean, "nfl_training_data.csv", row.names = FALSE)
+```
+
+```{r}
+model_df = read.csv("nfl_training_data.csv")
+model_df$catch = as.factor(model_df$catch)
+kable(head(model_df, 1), caption = "A single play evaluated with our features")
+```
+
+# Random Forest
+
+We decided that the Random Forest Model was the best choice for this project because of its unique ability to handle the nonlinear, interaction heavy nature of the features and their relationships with catch probability. The outcome of NFL deep-balls relies heavily on how receiver speed, separation, and positioning relative to the ball landing location interact to ultimately determine the outcome. Tree-based models capture these nonlinear patterns much more effectively than a linear or logistic regression model. A receiver may only need a little more space or separation to make a play, which a linear or logistic model would completely miss.
+
+```{r model-fit}
+rf_model = randomForest(
+  catch ~ sep_at_throw + sep_at_arrival + 
+    defenders_within_3 + advantage_at_throw +
+    receiver_speed + height_diff,
+  data = model_df,
+  ntree = 1000,
+  mtry = 3,
+  importance = TRUE
+)
+model_df$predicted_prob = predict(rf_model, type = "prob")[, "1"]
+model_df$predicted_class = ifelse(model_df$predicted_prob > 0.5, 1, 0)
+model_df$predicted_class = as.factor(model_df$predicted_class)
+
+```
+
+## Importance Table
+By looking at the MeanDecreaseAccuracy column, you can see the importance of each feature in our model. Unsurprisingly, separation at arrival is the strongest predictor, because that is the last moment the defender is able to make a play on either the ball or the receiver. 
+
+```{r load-model}
+saveRDS(rf_model, "nfl_catch_probability_rf_model.rds")
+kable(importance(rf_model)) #can clearly see which features are most important, with sep at arrival dominating
+```
+
+## Best Catch
+We can find the least probable catch from the 2023 season and observe some of the features. It may not be obvious by just looking at the numbers as to why this was so unlikely, but looking at it in context may make it make more sense. This play was a last second hail mary completed by Russel Wilson to Brandon Johnson after being bobbled in the endzone by both Broncos and Commanders players. 
+
+```{r}
+best_catch = model_df %>% # Just to provide a little intuition. This was a Russel Wilson hail mary, so makes sense it has a low probability
+  filter(catch == 1) %>% 
+  arrange(predicted_prob) %>% 
+  head(1)
+kable(best_catch)
+kable(data %>% filter(game_play == best_catch$game_play) %>% select(season, week, home_team_abbr, visitor_team_abbr, play_description, quarter, min, sec))
+```
+
+# Evaluating a Play While the Ball is in the Air
+The main goal of this project was to evaluate a play while the ball is in the air and observe how split second decisions made by receivers and defenders effect the catch probability. We can use the tracking data from the output files provided to get features from every frame while the ball is in the air, and then run that through our model to get the estimated catch probability at that instant. Merging these together allows us to zoom out and see the how the probability changes as the play develops. We can then take this analysis a step further by identifying "critical moments", which we define as changes in catch probability greater than 10% at any single frame. Seeing what the players are doing at these moments will give us insight into how split second decisions change the probability of a successful play. 
+
+```{r evaluate-single-play}
+evaluate_single_play = function(play_input_df, play_output_df, model = rf_model){
+  receiver_idx = play_input_df %>% 
+    filter(player_role == "Targeted Receiver") %>% 
+    pull(nfl_id) %>% 
+    unique()
+  
+  defenders_idx = play_input_df %>% 
+    filter(player_role == "Defensive Coverage") %>% 
+    pull(nfl_id) %>% 
+    unique()
+  
+  output_frames = sort(unique(play_output_df$frame_id))
+  
+  frame_features = lapply(output_frames, function(f){
+    frame_data = play_output_df %>% filter(frame_id == f)
+    receiver = frame_data %>% filter(nfl_id == receiver_idx)
+    defenders = frame_data %>% filter(nfl_id %in% defenders_idx)
+    
+    distances = sqrt((defenders$x - receiver$x)^2 + (defenders$y - receiver$y)^2)
+    
+    sep_at_frame = min(distances, na.rm = TRUE)
+    defenders_within_3 = sum(distances <= 3, na.rm = TRUE)
+    
+    distance_advantage = get_distance_advantage_throw(play_input_df)
+    
+    # Only need to calculate speed and height once
+    receiver_speed = get_receiver_speed(play_input_df)
+    height_diff = get_height_difference(play_input_df, play_output_df)
+
+    data.frame(
+      frame_id = f,
+      separation_at_frame = sep_at_frame,
+      defenders_within_3 = defenders_within_3,
+      receiver_speed = receiver_speed,
+      height_diff = height_diff
+    )
+  }) %>% 
+    bind_rows()
+  
+  frame_features = frame_features %>% drop_na()
+  frame_features$advantage_at_throw = get_distance_advantage_throw(play_input_df)
+  sep_at_throw = get_separation_at_throw(play_input_df)
+  frame_features$separation_at_throw = sep_at_throw
+  
+  prediction_data = frame_features %>%
+    rename(
+      sep_at_arrival = separation_at_frame,
+      sep_at_throw = separation_at_throw
+    ) %>%
+    select(sep_at_throw, sep_at_arrival, defenders_within_3, 
+           receiver_speed, height_diff, advantage_at_throw)
+  
+  probs = predict(model, prediction_data, type = "prob")
+  
+  frame_features$catch_prob = probs[, "1"]
+  
+  frame_features = frame_features %>% #Find critical moments of the play
+    mutate(
+      prob_change = catch_prob - lag(catch_prob),
+      is_critical = abs(prob_change) > 0.1,  # Critical moment threshold
+      separation_change = separation_at_frame - lag(separation_at_frame)
+    )
+  
+  critical_moments = frame_features %>% filter(is_critical == TRUE) %>% select(frame_id, separation_at_frame, defenders_within_3, catch_prob, separation_change)
+
+  last_frame = max(frame_features$frame_id, na.rm = TRUE)
+  catch_prob = frame_features$catch_prob[frame_features$frame_id == last_frame]
+  
+  play_input_df$game_play = paste0(play_input_df$game_id, "_", play_input_df$play_id)
+  game_play_id = unique(play_input_df$game_play)[1]
+  
+  play_info = data %>% filter(game_play == game_play_id)
+  description =  play_info$play_description
+  home_team = play_info$home_team_abbr
+  away_team = play_info$visitor_team_abbr
+  week = play_info$week
+  date = play_info$game_date
+  quarter = play_info$quarter
+
+  p <- ggplot(frame_features, aes(x = frame_id)) +
+    geom_line(aes(y = catch_prob), linewidth = 1, color = "steelblue") +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = "Completion Probability Over Time",
+      x = "Frame",
+      y = "Catch Probability",
+      subtitle = paste0(date," ", home_team, " vs. ", away_team, " week ", week, 
+                        "\n", "Quarter: ", quarter, " ", description)
+    ) +
+    geom_rect(data = critical_moments,
+              aes(xmin = frame_id - 1, xmax = frame_id,
+                  ymin = 0, ymax = 1),
+              fill = "green3", alpha = 0.3, inherit.aes = FALSE) +
+    ylim(0, 1) +
+    geom_vline(
+      xintercept = last_frame,
+      linetype = "dashed",
+      color = "red",
+      linewidth = 1
+    )
+  
+  return(list(
+    plot = p + theme_bw(),
+    catch_prob_at_arrival = catch_prob,
+    last_frame = last_frame,
+    critical_moments_df = critical_moments,
+    frame_features_df = frame_features
+  ))
+}
+
+```
+
+
+```{r play-eval, message=FALSE, warning=FALSE}
+get_play = function(week_num, play_number) {
+  week_str = sprintf("%02d", week_num)
+  
+  input_file = paste0("114239_nfl_competition_files_published_analytics_final/train/input/input_2023_w", week_str, ".csv")
+  output_file = paste0("114239_nfl_competition_files_published_analytics_final/train/output/output_2023_w", week_str, ".csv")
+  
+  week_input = read.csv(input_file)
+  week_output = read.csv(output_file)
+
+  week_input$game_play = paste0(week_input$game_id, "_", week_input$play_id)
+  week_output$game_play = paste0(week_output$game_id, "_", week_output$play_id)
+
+
+  play_ids = data %>% filter( #pull from data so that it is pre-filtered
+    week == week_num) %>% 
+    pull(game_play)
+  
+  if(play_number > length(play_ids)) { # makes sure inputs are within range
+    stop(paste("Play number out of range"))
+  }
+  
+  game_play_id = play_ids[play_number]
+  
+  play_input = week_input %>% filter(game_play == game_play_id)
+  play_output = week_output %>% filter(game_play == game_play_id)
+  
+  
+  return(list(
+    input = play_input,
+    output = play_output
+  ))
+}
+
+play = get_play(week_num =7, play_number = 21)
+result = evaluate_single_play(play$input, play$output, rf_model)
+kable(result$critical_moments_df)
+kable(head(result$frame_features_df))
+result$plot
+```
+
+```{r echo=FALSE}
+#gpid <- play$input$game_play
+
+tmp_in <-
+  play$input
+
+tmp_out <-
+  play$output
+
+ball_land_x <- tmp_in$ball_land_x[1]
+ball_land_y <- tmp_in$ball_land_y[1]
+all_players <- unique(c(tmp_in$nfl_id, tmp_out$nfl_id))
+
+oi_colors <- palette.colors(palette = "Okabe-Ito")
+
+par(mar = c(1,1,1,1), mgp = c(1.8, 0.5, 0))
+plot(1, type = "n", xlim = c(0,120), ylim = c(0, 54),
+     xaxt = "n", yaxt = "n", xlab = "", ylab = "")
+
+points(ball_land_x, ball_land_y, pch = 4, cex = 2, col = oi_colors[8])
+lines(x = c(tmp_in$absolute_yardline_number[1], tmp_in$absolute_yardline_number[1]),
+      y = c(par("usr")[3], par("usr")[4]))
+for(player in all_players){
+  player_in <-
+    tmp_in |>
+    dplyr::filter(nfl_id == player)
+  role <- player_in$player_role[1]
+
+  if(role %in% c("Passer", "Targeted Receiver", "Other Route Runner")){
+    points(player_in$x, player_in$y, pch = 16, cex = 0.5,
+           col = adjustcolor(oi_colors[9], alpha.f = 0.5))
+  } else{
+    points(player_in$x, player_in$y, pch = 15, cex = 0.5,
+           col = adjustcolor(oi_colors[9], alpha.f = 0.5))
+  }
+
+  if(player_in$player_to_predict[1]){
+    player_out <-
+      tmp_out |>
+      dplyr::filter(nfl_id == player)
+    if(role %in% c("Passer", "Targeted Receiver", "Other Route Runner")){
+      points(player_out$x, player_out$y, pch = 16, cex = 0.5,
+             col = adjustcolor(oi_colors[2], alpha.f = 0.75))
+    } else{
+        points(player_out$x, player_out$y, pch = 15, cex = 0.5,
+               col = adjustcolor(oi_colors[3], alpha.f = 0.75))
+    }
+  }
+}
+
+legend("topleft", legend = c("Offense", "Defense"), pch = c(15, 16), col = oi_colors[c(2,3)], bty = "n")
+legend("bottomright", legend = c("Pre-throw", "Ball in air", "Ball end location"), pch = c(16, 16, 4),
+       col = oi_colors[c(9,9, 8)], bty = "n")
+legend("topright", legend = "Code provided from p3 description", bty = "n")
+```
+
+The charts above illustrate the probability of a catch at each frame as the ball is in the air, as well as the locations of all relevant players before and after the ball is thrown. The colored shapes indicate when the ball is thrown. Seeing how the players positions change as the ball is in the air can provide some insight into how the model estimates the probability of a completion. The green columns highlight critical moments, which are then identified. You can see how the change in separation caused a significant decrease to the catch probability in those frames. 
+
+# Conclusion
+
+This project developed a real-time model for estimating the probability of a completed pass during the ball’s flight using NFL tracking data from the 2023 season. By integrating pre-throw and post-throw movement data with play-level information, we engineered a set of spatial and matchup features that characterize how receiver–defender interactions evolve throughout each passing play. Consistent with our expectations, our results show that separation at arrival is the dominant determinant of catch probability, with other features such as number of receivers within 3 yards and player advantage contributing limited but meaningful predictive value. Features such as height differential and receiver speed played comparatively minor roles, reinforcing the central importance of on-field positioning rather than physical traits alone. 
+
+A limitation worth noting is the exclusion of quarterback accuracy. As many football fans know, quarterback skill contributes perhaps more than any of these features alone, and can be the difference between a completion and an incompletion. Not incorporating this in our model, however, allows us to interpret our results in a much more broad sense. We can essentially say, that regardless of who is throwing the ball, this is the catch probability given these play and frame features. This interpretaion allows us to focus solely on the defenders and receivers and see how their movements and decisions affect the outcome of the play. 
