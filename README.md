@@ -2,18 +2,12 @@
 
 Predicting catch success using machine learning on Next Gen Stats tracking data from the 2023 season.
 
-<<<<<<< HEAD
 <img width="686" height="455" alt="Screenshot 2025-12-05 at 10 38 04 AM" src="https://github.com/user-attachments/assets/33ba9a30-4d3c-4aab-b77c-c06d4493738a" />
 
-## Project Overview
 
-
-=======
-![Demo visualization here - screenshot of your probability graph]
 
 ## Project Overview
 
->>>>>>> 4d75b2a (html changes)
 Built a Random Forest model to predict catch probability based on player positioning, achieving 64% accuracy. The system identifies critical moments where positioning changes shifted catch probability by 10%+.
 
 ## Key Features
@@ -57,13 +51,7 @@ result <- evaluate_single_play(play$input, play$output, model)
 print(result$plot)
 ```
 
-<<<<<<< HEAD
-=======
-## 📈 Sample Output
 
-[Include 2-3 compelling visualizations]
-
->>>>>>> 4d75b2a (html changes)
 ## Key Insights
 
 1.  Separation at ball arrival is the strongest predictor (MeanDecreaseAccuracy: 30.8)
